@@ -2,8 +2,15 @@ use crate::{body::Body, metrics::Metrics, quadtree::Quadtree, utils};
 
 use broccoli::aabb::Rect;
 use broccoli_rayon::{build::RayonBuildPar, prelude::RayonQueryPar};
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use ultraviolet::Vec2;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Contact {
+    last_frame: usize,
+    streak: u32,
+}
 
 pub struct Simulation {
     pub dt: f32,
@@ -11,12 +18,13 @@ pub struct Simulation {
     pub bodies: Vec<Body>,
     pub quadtree: Quadtree,
     pub metrics: Metrics,
+    contacts: HashMap<(u64, u64), Contact>,
 }
 
 impl Simulation {
     pub fn new() -> Self {
         let dt = 0.05;
-        let n = 100000;
+        let n = 200000;
         let theta = 1.0;
         let epsilon = 1.0;
         let leaf_capacity = 16;
@@ -31,6 +39,7 @@ impl Simulation {
             bodies,
             quadtree,
             metrics: Metrics::default(),
+            contacts: HashMap::new(),
         }
     }
 
@@ -88,20 +97,64 @@ impl Simulation {
 
         let mut broccoli = broccoli::Tree::par_new(&mut rects);
 
-        let ptr = self as *mut Self as usize;
+        let pairs = broccoli.par_find_colliding_pairs_acc_closure(
+            Vec::<(usize, usize)>::new(),
+            |_| Vec::<(usize, usize)>::new(),
+            |acc, mut b| acc.append(&mut b),
+            |acc, i, j| {
+                let i = *i.unpack_inner();
+                let j = *j.unpack_inner();
+                acc.push((i, j));
+            },
+        );
 
-        let pairs = std::sync::atomic::AtomicUsize::new(0);
-        broccoli.par_find_colliding_pairs(|i, j| {
-            let sim = unsafe { &mut *(ptr as *mut Self) };
-            pairs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let frame = self.frame;
+        let fuse_enabled =
+            crate::renderer::FUSE_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+        let fuse_steps = crate::renderer::FUSE_AFTER_FRAMES
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(1) as u32;
 
-            let i = *i.unpack_inner();
-            let j = *j.unpack_inner();
+        let mut fuse_set = HashSet::<(u64, u64)>::new();
+        let mut fuse_pairs = Vec::<(usize, usize)>::new();
+        for &(i, j) in &pairs {
+            let a = self.bodies[i].id;
+            let b = self.bodies[j].id;
+            let key = if a < b { (a, b) } else { (b, a) };
 
-            sim.resolve(i, j);
-        });
+            let entry = self.contacts.entry(key).or_default();
+            entry.streak = if entry.last_frame + 1 == frame {
+                entry.streak.saturating_add(1)
+            } else {
+                1
+            };
+            entry.last_frame = frame;
 
-        pairs.load(std::sync::atomic::Ordering::Relaxed)
+            if fuse_enabled && entry.streak >= fuse_steps {
+                fuse_set.insert(key);
+                fuse_pairs.push((i, j));
+            }
+        }
+
+        if frame % 30 == 0 {
+            self.contacts
+                .retain(|_, c| frame.saturating_sub(c.last_frame) <= 1);
+        }
+
+        for &(i, j) in &pairs {
+            let a = self.bodies[i].id;
+            let b = self.bodies[j].id;
+            let key = if a < b { (a, b) } else { (b, a) };
+            if !fuse_set.contains(&key) {
+                self.resolve(i, j);
+            }
+        }
+
+        if fuse_enabled && !fuse_pairs.is_empty() {
+            self.fuse_contacts(fuse_pairs);
+        }
+
+        pairs.len()
     }
 
     fn resolve(&mut self, i: usize, j: usize) {
@@ -164,5 +217,126 @@ impl Simulation {
         self.bodies[j].vel = v2;
         self.bodies[i].pos += v1 * t;
         self.bodies[j].pos += v2 * t;
+    }
+
+    fn fuse_contacts(&mut self, pairs: Vec<(usize, usize)>) {
+        if pairs.is_empty() || self.bodies.is_empty() {
+            return;
+        }
+
+        let mut involved = Vec::<usize>::new();
+        involved.reserve(pairs.len() * 2);
+        for (i, j) in &pairs {
+            involved.push(*i);
+            involved.push(*j);
+        }
+        involved.sort_unstable();
+        involved.dedup();
+        if involved.len() <= 1 {
+            return;
+        }
+
+        let mut index_to_local = HashMap::<usize, usize>::with_capacity(involved.len());
+        for (local, &index) in involved.iter().enumerate() {
+            index_to_local.insert(index, local);
+        }
+
+        let mut uf = UnionFind::new(involved.len());
+        for (i, j) in pairs {
+            let (Some(&li), Some(&lj)) = (index_to_local.get(&i), index_to_local.get(&j)) else {
+                continue;
+            };
+            uf.union(li, lj);
+        }
+
+        #[derive(Clone, Copy, Default)]
+        struct Agg {
+            mass: f32,
+            pos_m: Vec2,
+            vel_m: Vec2,
+            id_min: u64,
+        }
+
+        let mut agg = HashMap::<usize, Agg>::new();
+        for (local, &index) in involved.iter().enumerate() {
+            let root = uf.find(local);
+            let body = self.bodies[index];
+            let entry = agg.entry(root).or_insert(Agg {
+                mass: 0.0,
+                pos_m: Vec2::zero(),
+                vel_m: Vec2::zero(),
+                id_min: body.id,
+            });
+            entry.mass += body.mass;
+            entry.pos_m += body.pos * body.mass;
+            entry.vel_m += body.vel * body.mass;
+            entry.id_min = entry.id_min.min(body.id);
+        }
+
+        let mut removed = vec![false; self.bodies.len()];
+        for &index in &involved {
+            if let Some(flag) = removed.get_mut(index) {
+                *flag = true;
+            }
+        }
+
+        let mut new_bodies = Vec::with_capacity(self.bodies.len() - involved.len() + agg.len());
+        for (index, body) in self.bodies.iter().copied().enumerate() {
+            if !removed[index] {
+                new_bodies.push(body);
+            }
+        }
+
+        for (_, a) in agg {
+            let inv_m = 1.0 / a.mass.max(f32::MIN_POSITIVE);
+            let pos = a.pos_m * inv_m;
+            let vel = a.vel_m * inv_m;
+            let mass = a.mass;
+            let radius = mass.cbrt();
+            new_bodies.push(Body::new(a.id_min, pos, vel, mass, radius));
+        }
+
+        self.bodies = new_bodies;
+    }
+}
+
+struct UnionFind {
+    parent: Vec<usize>,
+    rank: Vec<u8>,
+}
+
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n).collect(),
+            rank: vec![0; n],
+        }
+    }
+
+    fn find(&mut self, x: usize) -> usize {
+        let parent = self.parent[x];
+        if parent == x {
+            return x;
+        }
+        let root = self.find(parent);
+        self.parent[x] = root;
+        root
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let mut a = self.find(a);
+        let mut b = self.find(b);
+        if a == b {
+            return;
+        }
+        let ra = self.rank[a];
+        let rb = self.rank[b];
+        if ra < rb {
+            std::mem::swap(&mut a, &mut b);
+        }
+        self.parent[b] = a;
+        if ra == rb {
+            self.rank[a] = ra.saturating_add(1);
+        }
     }
 }

@@ -24,10 +24,14 @@ pub static FRAME_DELAY_MS: Lazy<AtomicU64> = Lazy::new(|| 0.into());
 pub static USE_RANDOM_COLORS: Lazy<AtomicBool> = Lazy::new(|| false.into());
 pub static COLOR_SEED: Lazy<AtomicU64> = Lazy::new(|| 0.into());
 pub static NEXT_BODY_ID: Lazy<AtomicU64> = Lazy::new(|| 0.into());
+pub static FUSE_ENABLED: Lazy<AtomicBool> = Lazy::new(|| true.into());
+pub static FUSE_AFTER_FRAMES: Lazy<AtomicU64> = Lazy::new(|| 20.into());
+pub static RESET_REQUESTED: Lazy<AtomicBool> = Lazy::new(|| false.into());
 
 pub static BODIES: Lazy<Mutex<Vec<Body>>> = Lazy::new(|| Mutex::new(Vec::new()));
 pub static QUADTREE: Lazy<Mutex<Vec<Node>>> = Lazy::new(|| Mutex::new(Vec::new()));
 pub static METRICS: Lazy<Mutex<MetricsSnapshot>> = Lazy::new(|| Mutex::new(MetricsSnapshot::default()));
+pub static WANT_QUADTREE: Lazy<AtomicBool> = Lazy::new(|| false.into());
 
 pub static SPAWN: Lazy<Mutex<Vec<Body>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
@@ -43,6 +47,8 @@ pub struct Renderer {
 
     depth_range: (usize, usize),
     frame_delay_ms: u64,
+    fuse_enabled: bool,
+    fuse_after_frames: u64,
 
     spawn_body: Option<Body>,
     angle: Option<f32>,
@@ -89,6 +95,8 @@ impl quarkstrom::Renderer for Renderer {
 
             depth_range: (0, 0),
             frame_delay_ms: FRAME_DELAY_MS.load(Ordering::Relaxed),
+            fuse_enabled: FUSE_ENABLED.load(Ordering::Relaxed),
+            fuse_after_frames: FUSE_AFTER_FRAMES.load(Ordering::Relaxed),
 
             spawn_body: None,
             angle: None,
@@ -316,7 +324,9 @@ impl quarkstrom::Renderer for Renderer {
                     ui.label(format!("seed {}", seed));
                 });
 
-                ui.checkbox(&mut self.show_quadtree, "Show Quadtree");
+                if ui.checkbox(&mut self.show_quadtree, "Show Quadtree").changed() {
+                    WANT_QUADTREE.store(self.show_quadtree, Ordering::Relaxed);
+                }
                 if self.show_quadtree {
                     let range = &mut self.depth_range;
                     ui.horizontal(|ui| {
@@ -329,11 +339,28 @@ impl quarkstrom::Renderer for Renderer {
 
                 ui.separator();
                 ui.label("Playback");
+                if ui.button("Reset Simulation").clicked() {
+                    RESET_REQUESTED.store(true, Ordering::Relaxed);
+                }
                 ui.add(
                     egui::Slider::new(&mut self.frame_delay_ms, 0..=500)
                         .text("Frame Delay (ms)"),
                 );
                 FRAME_DELAY_MS.store(self.frame_delay_ms, Ordering::Relaxed);
+
+                ui.separator();
+                ui.label("Fusion");
+                if ui
+                    .checkbox(&mut self.fuse_enabled, "Fuse Persistent Contacts")
+                    .changed()
+                {
+                    FUSE_ENABLED.store(self.fuse_enabled, Ordering::Relaxed);
+                }
+                ui.add(
+                    egui::Slider::new(&mut self.fuse_after_frames, 1..=240)
+                        .text("Fuse After (frames)"),
+                );
+                FUSE_AFTER_FRAMES.store(self.fuse_after_frames, Ordering::Relaxed);
 
                 ui.separator();
                 ui.label("Timing (ms)");

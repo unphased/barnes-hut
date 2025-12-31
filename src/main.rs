@@ -27,6 +27,12 @@ fn main() {
 
     std::thread::spawn(move || {
 	    loop {
+            if renderer::RESET_REQUESTED.swap(false, Ordering::Relaxed) {
+                simulation = Simulation::new();
+                renderer::NEXT_BODY_ID.store(simulation.bodies.len() as u64, Ordering::Relaxed);
+                renderer::SPAWN.lock().clear();
+            }
+
 	        if renderer::PAUSED.load(Ordering::Relaxed) {
 	            std::thread::yield_now();
 	        } else {
@@ -57,7 +63,9 @@ fn render(simulation: &mut Simulation) {
     {
         let mut lock = renderer::QUADTREE.lock();
         lock.clear();
-        lock.extend_from_slice(&simulation.quadtree.nodes);
+        if renderer::WANT_QUADTREE.load(Ordering::Relaxed) {
+            lock.extend_from_slice(&simulation.quadtree.nodes);
+        }
     }
     {
         let mut lock = renderer::METRICS.lock();
