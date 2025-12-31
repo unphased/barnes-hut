@@ -24,9 +24,16 @@ pub static FRAME_DELAY_MS: Lazy<AtomicU64> = Lazy::new(|| 0.into());
 pub static USE_RANDOM_COLORS: Lazy<AtomicBool> = Lazy::new(|| false.into());
 pub static COLOR_SEED: Lazy<AtomicU64> = Lazy::new(|| 0.into());
 pub static NEXT_BODY_ID: Lazy<AtomicU64> = Lazy::new(|| 0.into());
-pub static FUSE_ENABLED: Lazy<AtomicBool> = Lazy::new(|| true.into());
+pub static FUSE_ENABLED: Lazy<AtomicBool> = Lazy::new(|| false.into());
 pub static FUSE_AFTER_FRAMES: Lazy<AtomicU64> = Lazy::new(|| 20.into());
 pub static RESET_REQUESTED: Lazy<AtomicBool> = Lazy::new(|| false.into());
+
+pub static BONDS_ENABLED: Lazy<AtomicBool> = Lazy::new(|| true.into());
+pub static BOND_AFTER_FRAMES: Lazy<AtomicU64> = Lazy::new(|| 15.into());
+pub static MAX_BONDS_PER_BODY: Lazy<AtomicU64> = Lazy::new(|| 4.into());
+pub static BOND_ITERS: Lazy<AtomicU64> = Lazy::new(|| 2.into());
+pub static BOND_BREAK_SPEED: Lazy<AtomicU64> = Lazy::new(|| 2500.into()); // 2.5 units/s
+pub static BOND_BREAK_ERROR: Lazy<AtomicU64> = Lazy::new(|| 5000.into()); // 5.0 units
 
 pub static BODIES: Lazy<Mutex<Vec<Body>>> = Lazy::new(|| Mutex::new(Vec::new()));
 pub static QUADTREE: Lazy<Mutex<Vec<Node>>> = Lazy::new(|| Mutex::new(Vec::new()));
@@ -49,6 +56,12 @@ pub struct Renderer {
     frame_delay_ms: u64,
     fuse_enabled: bool,
     fuse_after_frames: u64,
+    bonds_enabled: bool,
+    bond_after_frames: u64,
+    max_bonds_per_body: u64,
+    bond_iters: u64,
+    bond_break_speed_milli: u64,
+    bond_break_error_milli: u64,
 
     spawn_body: Option<Body>,
     angle: Option<f32>,
@@ -97,6 +110,12 @@ impl quarkstrom::Renderer for Renderer {
             frame_delay_ms: FRAME_DELAY_MS.load(Ordering::Relaxed),
             fuse_enabled: FUSE_ENABLED.load(Ordering::Relaxed),
             fuse_after_frames: FUSE_AFTER_FRAMES.load(Ordering::Relaxed),
+            bonds_enabled: BONDS_ENABLED.load(Ordering::Relaxed),
+            bond_after_frames: BOND_AFTER_FRAMES.load(Ordering::Relaxed),
+            max_bonds_per_body: MAX_BONDS_PER_BODY.load(Ordering::Relaxed),
+            bond_iters: BOND_ITERS.load(Ordering::Relaxed),
+            bond_break_speed_milli: BOND_BREAK_SPEED.load(Ordering::Relaxed),
+            bond_break_error_milli: BOND_BREAK_ERROR.load(Ordering::Relaxed),
 
             spawn_body: None,
             angle: None,
@@ -349,18 +368,61 @@ impl quarkstrom::Renderer for Renderer {
                 FRAME_DELAY_MS.store(self.frame_delay_ms, Ordering::Relaxed);
 
                 ui.separator();
-                ui.label("Fusion");
+                ui.label("Clumps");
                 if ui
-                    .checkbox(&mut self.fuse_enabled, "Fuse Persistent Contacts")
+                    .checkbox(&mut self.bonds_enabled, "Rigid Bonds (stabilize clumps)")
                     .changed()
                 {
-                    FUSE_ENABLED.store(self.fuse_enabled, Ordering::Relaxed);
+                    BONDS_ENABLED.store(self.bonds_enabled, Ordering::Relaxed);
                 }
                 ui.add(
-                    egui::Slider::new(&mut self.fuse_after_frames, 1..=240)
-                        .text("Fuse After (frames)"),
+                    egui::Slider::new(&mut self.bond_after_frames, 1..=240)
+                        .text("Bond After (frames)"),
                 );
-                FUSE_AFTER_FRAMES.store(self.fuse_after_frames, Ordering::Relaxed);
+                BOND_AFTER_FRAMES.store(self.bond_after_frames, Ordering::Relaxed);
+
+                ui.add(
+                    egui::Slider::new(&mut self.max_bonds_per_body, 0..=16)
+                        .text("Max Bonds / Body"),
+                );
+                MAX_BONDS_PER_BODY.store(self.max_bonds_per_body, Ordering::Relaxed);
+
+                ui.add(egui::Slider::new(&mut self.bond_iters, 0..=8).text("Bond Iters"));
+                BOND_ITERS.store(self.bond_iters, Ordering::Relaxed);
+
+                ui.add(
+                    egui::Slider::new(&mut self.bond_break_speed_milli, 0..=20000)
+                        .text("Break Speed"),
+                );
+                ui.label(format!(
+                    "{:.3} units/s",
+                    self.bond_break_speed_milli as f32 / 1000.0
+                ));
+                BOND_BREAK_SPEED.store(self.bond_break_speed_milli, Ordering::Relaxed);
+
+                ui.add(
+                    egui::Slider::new(&mut self.bond_break_error_milli, 0..=50000)
+                        .text("Break Error"),
+                );
+                ui.label(format!(
+                    "{:.3} units",
+                    self.bond_break_error_milli as f32 / 1000.0
+                ));
+                BOND_BREAK_ERROR.store(self.bond_break_error_milli, Ordering::Relaxed);
+
+                ui.collapsing("Fusion (deprecated)", |ui| {
+                    if ui
+                        .checkbox(&mut self.fuse_enabled, "Fuse Persistent Contacts")
+                        .changed()
+                    {
+                        FUSE_ENABLED.store(self.fuse_enabled, Ordering::Relaxed);
+                    }
+                    ui.add(
+                        egui::Slider::new(&mut self.fuse_after_frames, 1..=240)
+                            .text("Fuse After (frames)"),
+                    );
+                    FUSE_AFTER_FRAMES.store(self.fuse_after_frames, Ordering::Relaxed);
+                });
 
                 ui.separator();
                 ui.label("Timing (ms)");
