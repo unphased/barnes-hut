@@ -2,6 +2,7 @@ use ultraviolet::Vec2;
 
 #[derive(Clone, Copy)]
 pub struct Body {
+    pub id: u64,
     pub pos: Vec2,
     pub vel: Vec2,
     pub acc: Vec2,
@@ -10,8 +11,9 @@ pub struct Body {
 }
 
 impl Body {
-    pub fn new(pos: Vec2, vel: Vec2, mass: f32, radius: f32) -> Self {
+    pub fn new(id: u64, pos: Vec2, vel: Vec2, mass: f32, radius: f32) -> Self {
         Self {
+            id,
             pos,
             vel,
             acc: Vec2::zero(),

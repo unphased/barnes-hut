@@ -9,7 +9,7 @@ pub fn uniform_disc(n: usize) -> Vec<Body> {
     let mut bodies: Vec<Body> = Vec::with_capacity(n);
 
     let m = 1e6;
-    let center = Body::new(Vec2::zero(), Vec2::zero(), m as f32, inner_radius);
+    let center = Body::new(0, Vec2::zero(), Vec2::zero(), m as f32, inner_radius);
     bodies.push(center);
 
     while bodies.len() < n {
@@ -22,7 +22,7 @@ pub fn uniform_disc(n: usize) -> Vec<Body> {
         let mass = 1.0f32;
         let radius = mass.cbrt();
 
-        bodies.push(Body::new(pos, vel, mass, radius));
+        bodies.push(Body::new(0, pos, vel, mass, radius));
     }
 
     bodies.sort_by(|a, b| a.pos.mag_sq().total_cmp(&b.pos.mag_sq()));
@@ -35,6 +35,10 @@ pub fn uniform_disc(n: usize) -> Vec<Body> {
 
         let v = (mass / bodies[i].pos.mag()).sqrt();
         bodies[i].vel *= v;
+    }
+
+    for (id, body) in bodies.iter_mut().enumerate() {
+        body.id = id as u64;
     }
 
     bodies

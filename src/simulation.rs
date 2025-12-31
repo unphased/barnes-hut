@@ -1,7 +1,8 @@
-use crate::{body::Body, quadtree::Quadtree, utils};
+use crate::{body::Body, metrics::Metrics, quadtree::Quadtree, utils};
 
 use broccoli::aabb::Rect;
 use broccoli_rayon::{build::RayonBuildPar, prelude::RayonQueryPar};
+use std::time::Instant;
 use ultraviolet::Vec2;
 
 pub struct Simulation {
@@ -9,6 +10,7 @@ pub struct Simulation {
     pub frame: usize,
     pub bodies: Vec<Body>,
     pub quadtree: Quadtree,
+    pub metrics: Metrics,
 }
 
 impl Simulation {
@@ -28,19 +30,40 @@ impl Simulation {
             frame: 0,
             bodies,
             quadtree,
+            metrics: Metrics::default(),
         }
     }
 
     pub fn step(&mut self) {
+        self.metrics.begin_frame(self.frame);
+
+        let start = Instant::now();
         self.iterate();
-        self.collide();
+        self.metrics.snapshot_mut().last.iterate = start.elapsed();
+
+        let start = Instant::now();
+        let collision_pairs = self.collide();
+        self.metrics.snapshot_mut().last.collide = start.elapsed();
+        self.metrics.snapshot_mut().counts_last.collision_pairs = collision_pairs;
+
+        let start = Instant::now();
         self.attract();
+        self.metrics.snapshot_mut().last.attract_total = start.elapsed();
+
+        self.metrics.snapshot_mut().counts_last.bodies = self.bodies.len();
+        self.metrics.snapshot_mut().counts_last.quadtree_nodes_active = self.quadtree.active_nodes_len();
+        self.metrics.finish_frame();
         self.frame += 1;
     }
 
     pub fn attract(&mut self) {
+        let start = Instant::now();
         self.quadtree.build(&mut self.bodies);
+        self.metrics.snapshot_mut().last.quadtree_build = start.elapsed();
+
+        let start = Instant::now();
         self.quadtree.acc(&mut self.bodies);
+        self.metrics.snapshot_mut().last.quadtree_acc = start.elapsed();
     }
 
     pub fn iterate(&mut self) {
@@ -49,7 +72,7 @@ impl Simulation {
         }
     }
 
-    pub fn collide(&mut self) {
+    pub fn collide(&mut self) -> usize {
         let mut rects = self
             .bodies
             .iter()
@@ -66,15 +89,19 @@ impl Simulation {
         let mut broccoli = broccoli::Tree::par_new(&mut rects);
 
         let ptr = self as *mut Self as usize;
-        
+
+        let pairs = std::sync::atomic::AtomicUsize::new(0);
         broccoli.par_find_colliding_pairs(|i, j| {
             let sim = unsafe { &mut *(ptr as *mut Self) };
+            pairs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             let i = *i.unpack_inner();
             let j = *j.unpack_inner();
 
             sim.resolve(i, j);
         });
+
+        pairs.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn resolve(&mut self, i: usize, j: usize) {

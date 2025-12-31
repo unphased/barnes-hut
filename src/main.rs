@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 
 mod body;
+mod metrics;
 mod partition;
 mod quadtree;
 mod renderer;
@@ -22,6 +23,7 @@ fn main() {
     };
 
     let mut simulation = Simulation::new();
+    renderer::NEXT_BODY_ID.store(simulation.bodies.len() as u64, Ordering::Relaxed);
 
     std::thread::spawn(move || {
 	    loop {
@@ -31,6 +33,11 @@ fn main() {
 	            simulation.step();
 	        }
 	        render(&mut simulation);
+
+            let delay_ms = renderer::FRAME_DELAY_MS.load(Ordering::Relaxed);
+            if delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
 	    }
     });
 
@@ -51,6 +58,10 @@ fn render(simulation: &mut Simulation) {
         let mut lock = renderer::QUADTREE.lock();
         lock.clear();
         lock.extend_from_slice(&simulation.quadtree.nodes);
+    }
+    {
+        let mut lock = renderer::METRICS.lock();
+        *lock = simulation.metrics.snapshot();
     }
     *lock |= true;
 }

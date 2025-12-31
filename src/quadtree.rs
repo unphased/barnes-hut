@@ -122,6 +122,10 @@ impl Quadtree {
         self.atomic_len.store(0, Ordering::Relaxed);
     }
 
+    pub fn active_nodes_len(&self) -> usize {
+        self.atomic_len.load(Ordering::Relaxed) * 4 + 1
+    }
+
     pub fn subdivide(&mut self, node: usize, bodies: &mut [Body], range: Range<usize>) -> usize {
         let center = self.nodes[node].quad.center;
 

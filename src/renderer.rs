@@ -1,10 +1,11 @@
 use std::{
     f32::consts::{PI, TAU},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use crate::{
     body::Body,
+    metrics::{duration_ms, MetricsSnapshot},
     quadtree::{Node, Quadtree},
 };
 
@@ -19,8 +20,14 @@ use parking_lot::Mutex;
 pub static PAUSED: Lazy<AtomicBool> = Lazy::new(|| false.into());
 pub static UPDATE_LOCK: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 
+pub static FRAME_DELAY_MS: Lazy<AtomicU64> = Lazy::new(|| 0.into());
+pub static USE_RANDOM_COLORS: Lazy<AtomicBool> = Lazy::new(|| false.into());
+pub static COLOR_SEED: Lazy<AtomicU64> = Lazy::new(|| 0.into());
+pub static NEXT_BODY_ID: Lazy<AtomicU64> = Lazy::new(|| 0.into());
+
 pub static BODIES: Lazy<Mutex<Vec<Body>>> = Lazy::new(|| Mutex::new(Vec::new()));
 pub static QUADTREE: Lazy<Mutex<Vec<Node>>> = Lazy::new(|| Mutex::new(Vec::new()));
+pub static METRICS: Lazy<Mutex<MetricsSnapshot>> = Lazy::new(|| Mutex::new(MetricsSnapshot::default()));
 
 pub static SPAWN: Lazy<Mutex<Vec<Body>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
@@ -31,9 +38,11 @@ pub struct Renderer {
     settings_window_open: bool,
 
     show_bodies: bool,
+    use_random_colors: bool,
     show_quadtree: bool,
 
     depth_range: (usize, usize),
+    frame_delay_ms: u64,
 
     spawn_body: Option<Body>,
     angle: Option<f32>,
@@ -43,6 +52,27 @@ pub struct Renderer {
 
     bodies: Vec<Body>,
     quadtree: Vec<Node>,
+    metrics: MetricsSnapshot,
+}
+
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d049bb133111eb);
+    x ^= x >> 31;
+    x
+}
+
+fn color_for_id(id: u64, seed: u64) -> [u8; 4] {
+    let x = mix64(id ^ seed);
+    let r = ((x >> 0) & 0xff) as u8;
+    let g = ((x >> 8) & 0xff) as u8;
+    let b = ((x >> 16) & 0xff) as u8;
+    let r = r / 2 + 96;
+    let g = g / 2 + 96;
+    let b = b / 2 + 96;
+    [r, g, b, 0xff]
 }
 
 impl quarkstrom::Renderer for Renderer {
@@ -54,9 +84,11 @@ impl quarkstrom::Renderer for Renderer {
             settings_window_open: false,
 
             show_bodies: true,
+            use_random_colors: USE_RANDOM_COLORS.load(Ordering::Relaxed),
             show_quadtree: false,
 
             depth_range: (0, 0),
+            frame_delay_ms: FRAME_DELAY_MS.load(Ordering::Relaxed),
 
             spawn_body: None,
             angle: None,
@@ -66,6 +98,7 @@ impl quarkstrom::Renderer for Renderer {
 
             bodies: Vec::new(),
             quadtree: Vec::new(),
+            metrics: MetricsSnapshot::default(),
         }
     }
 
@@ -114,7 +147,8 @@ impl quarkstrom::Renderer for Renderer {
 
         if input.mouse_pressed(1) {
             let mouse = world_mouse();
-            self.spawn_body = Some(Body::new(mouse, Vec2::zero(), 1.0, 1.0));
+            let id = NEXT_BODY_ID.fetch_add(1, Ordering::Relaxed);
+            self.spawn_body = Some(Body::new(id, mouse, Vec2::zero(), 1.0, 1.0));
             self.angle = None;
             self.total = Some(0.0);
         } else if input.mouse_held(1) {
@@ -148,6 +182,7 @@ impl quarkstrom::Renderer for Renderer {
             if *lock {
                 std::mem::swap(&mut self.bodies, &mut BODIES.lock());
                 std::mem::swap(&mut self.quadtree, &mut QUADTREE.lock());
+                self.metrics = *METRICS.lock();
             }
             if let Some(body) = self.confirmed_bodies.take() {
                 self.bodies.push(body);
@@ -164,18 +199,36 @@ impl quarkstrom::Renderer for Renderer {
 
         if !self.bodies.is_empty() {
             if self.show_bodies {
+                let seed = COLOR_SEED.load(Ordering::Relaxed);
                 for i in 0..self.bodies.len() {
-                    ctx.draw_circle(self.bodies[i].pos, self.bodies[i].radius, [0xff; 4]);
+                    let color = if self.use_random_colors {
+                        color_for_id(self.bodies[i].id, seed)
+                    } else {
+                        [0xff; 4]
+                    };
+                    ctx.draw_circle(self.bodies[i].pos, self.bodies[i].radius, color);
                 }
             }
 
             if let Some(body) = &self.confirmed_bodies {
-                ctx.draw_circle(body.pos, body.radius, [0xff; 4]);
+                let seed = COLOR_SEED.load(Ordering::Relaxed);
+                let color = if self.use_random_colors {
+                    color_for_id(body.id, seed)
+                } else {
+                    [0xff; 4]
+                };
+                ctx.draw_circle(body.pos, body.radius, color);
                 ctx.draw_line(body.pos, body.pos + body.vel, [0xff; 4]);
             }
 
             if let Some(body) = &self.spawn_body {
-                ctx.draw_circle(body.pos, body.radius, [0xff; 4]);
+                let seed = COLOR_SEED.load(Ordering::Relaxed);
+                let color = if self.use_random_colors {
+                    color_for_id(body.id, seed)
+                } else {
+                    [0xff; 4]
+                };
+                ctx.draw_circle(body.pos, body.radius, color);
                 ctx.draw_line(body.pos, body.pos + body.vel, [0xff; 4]);
             }
         }
@@ -248,6 +301,21 @@ impl quarkstrom::Renderer for Renderer {
             .open(&mut self.settings_window_open)
             .show(ctx, |ui| {
                 ui.checkbox(&mut self.show_bodies, "Show Bodies");
+                let mut use_random_colors = self.use_random_colors;
+                if ui.checkbox(&mut use_random_colors, "Random Colors").changed() {
+                    self.use_random_colors = use_random_colors;
+                    USE_RANDOM_COLORS.store(use_random_colors, Ordering::Relaxed);
+                }
+
+                ui.horizontal(|ui| {
+                    let mut seed = COLOR_SEED.load(Ordering::Relaxed);
+                    if ui.button("Re-roll Colors").clicked() {
+                        seed = fastrand::u64(1..u64::MAX);
+                        COLOR_SEED.store(seed, Ordering::Relaxed);
+                    }
+                    ui.label(format!("seed {}", seed));
+                });
+
                 ui.checkbox(&mut self.show_quadtree, "Show Quadtree");
                 if self.show_quadtree {
                     let range = &mut self.depth_range;
@@ -258,6 +326,84 @@ impl quarkstrom::Renderer for Renderer {
                         ui.add(egui::DragValue::new(&mut range.1).speed(0.05));
                     });
                 }
+
+                ui.separator();
+                ui.label("Playback");
+                ui.add(
+                    egui::Slider::new(&mut self.frame_delay_ms, 0..=500)
+                        .text("Frame Delay (ms)"),
+                );
+                FRAME_DELAY_MS.store(self.frame_delay_ms, Ordering::Relaxed);
+
+                ui.separator();
+                ui.label("Timing (ms)");
+                ui.label(format!("frame {}", self.metrics.frame));
+                let last = self.metrics.last;
+                let avg = self.metrics.avg;
+                let fps = 1000.0 / duration_ms(avg.total()).max(1e-6);
+                ui.label(format!("avg {:.1} fps", fps));
+                egui::Grid::new("timings_grid").striped(true).show(ui, |ui| {
+                    ui.label("");
+                    ui.label("last");
+                    ui.label("avg");
+                    ui.end_row();
+
+                    ui.label("total");
+                    ui.label(format!("{:.3}", duration_ms(last.total())));
+                    ui.label(format!("{:.3}", duration_ms(avg.total())));
+                    ui.end_row();
+
+                    ui.label("iterate");
+                    ui.label(format!("{:.3}", duration_ms(last.iterate)));
+                    ui.label(format!("{:.3}", duration_ms(avg.iterate)));
+                    ui.end_row();
+
+                    ui.label("collide");
+                    ui.label(format!("{:.3}", duration_ms(last.collide)));
+                    ui.label(format!("{:.3}", duration_ms(avg.collide)));
+                    ui.end_row();
+
+                    ui.label("attract total");
+                    ui.label(format!("{:.3}", duration_ms(last.attract_total)));
+                    ui.label(format!("{:.3}", duration_ms(avg.attract_total)));
+                    ui.end_row();
+
+                    ui.label("  build");
+                    ui.label(format!("{:.3}", duration_ms(last.quadtree_build)));
+                    ui.label(format!("{:.3}", duration_ms(avg.quadtree_build)));
+                    ui.end_row();
+
+                    ui.label("  acc");
+                    ui.label(format!("{:.3}", duration_ms(last.quadtree_acc)));
+                    ui.label(format!("{:.3}", duration_ms(avg.quadtree_acc)));
+                    ui.end_row();
+                });
+
+                ui.separator();
+                ui.label("Counts (avg over window)");
+                let c_last = self.metrics.counts_last;
+                let c_avg = self.metrics.counts_avg;
+                egui::Grid::new("counts_grid").striped(true).show(ui, |ui| {
+                    ui.label("");
+                    ui.label("last");
+                    ui.label("avg");
+                    ui.end_row();
+
+                    ui.label("bodies");
+                    ui.label(format!("{}", c_last.bodies));
+                    ui.label(format!("{}", c_avg.bodies));
+                    ui.end_row();
+
+                    ui.label("active quadtree nodes");
+                    ui.label(format!("{}", c_last.quadtree_nodes_active));
+                    ui.label(format!("{}", c_avg.quadtree_nodes_active));
+                    ui.end_row();
+
+                    ui.label("collision pairs");
+                    ui.label(format!("{}", c_last.collision_pairs));
+                    ui.label(format!("{}", c_avg.collision_pairs));
+                    ui.end_row();
+                });
             });
     }
 }
