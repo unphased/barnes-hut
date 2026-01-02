@@ -29,12 +29,31 @@ pub static FUSE_AFTER_FRAMES: Lazy<AtomicU64> = Lazy::new(|| 20.into());
 pub static RESET_REQUESTED: Lazy<AtomicBool> = Lazy::new(|| false.into());
 pub static INIT_PARTICLES: Lazy<AtomicU64> = Lazy::new(|| 200_000.into());
 
-pub static BONDS_ENABLED: Lazy<AtomicBool> = Lazy::new(|| true.into());
+pub static BONDS_ENABLED: Lazy<AtomicBool> = Lazy::new(|| false.into());
 pub static BOND_AFTER_FRAMES: Lazy<AtomicU64> = Lazy::new(|| 15.into());
 pub static MAX_BONDS_PER_BODY: Lazy<AtomicU64> = Lazy::new(|| 4.into());
 pub static BOND_ITERS: Lazy<AtomicU64> = Lazy::new(|| 2.into());
 pub static BOND_BREAK_SPEED: Lazy<AtomicU64> = Lazy::new(|| 2500.into()); // 2.5 units/s
 pub static BOND_BREAK_ERROR: Lazy<AtomicU64> = Lazy::new(|| 5000.into()); // 5.0 units
+
+pub static SPAWN_RANDOMIZE: Lazy<AtomicBool> = Lazy::new(|| false.into());
+pub static INIT_RANDOMIZE: Lazy<AtomicBool> = Lazy::new(|| false.into());
+pub static LINK_RADIUS_TO_MASS: Lazy<AtomicBool> = Lazy::new(|| true.into());
+pub static MASS_MIN_MILLI: Lazy<AtomicU64> = Lazy::new(|| 1000.into());
+pub static MASS_MAX_MILLI: Lazy<AtomicU64> = Lazy::new(|| 1000.into());
+pub static DIAM_MIN_MILLI: Lazy<AtomicU64> = Lazy::new(|| 2000.into());
+pub static DIAM_MAX_MILLI: Lazy<AtomicU64> = Lazy::new(|| 2000.into());
+
+pub static VEL_FILTER_ALPHA_MILLI: Lazy<AtomicU64> = Lazy::new(|| 1000.into()); // 1.0 = off
+pub static VEL_FILTER_CONTACTS_ONLY: Lazy<AtomicBool> = Lazy::new(|| true.into());
+pub static VEL_FILTER_MIN_CONTACTS: Lazy<AtomicU64> = Lazy::new(|| 2.into());
+
+pub static CLUMP_DAMP_ENABLED: Lazy<AtomicBool> = Lazy::new(|| true.into());
+pub static CLUMP_DAMP_CONTACTS_ONLY: Lazy<AtomicBool> = Lazy::new(|| true.into());
+pub static CLUMP_DAMP_MIN_CONTACTS: Lazy<AtomicU64> = Lazy::new(|| 4.into());
+pub static CLUMP_DAMP_SPEED_MILLI: Lazy<AtomicU64> = Lazy::new(|| 800.into()); // 0.8 units/s
+pub static CLUMP_DAMP_E_LOW_MILLI: Lazy<AtomicU64> = Lazy::new(|| 0.into()); // 0.0
+pub static CLUMP_DAMP_E_HIGH_MILLI: Lazy<AtomicU64> = Lazy::new(|| 500.into()); // 0.5 (current)
 
 pub static BODIES: Lazy<Mutex<Vec<Body>>> = Lazy::new(|| Mutex::new(Vec::new()));
 pub static QUADTREE: Lazy<Mutex<Vec<Node>>> = Lazy::new(|| Mutex::new(Vec::new()));
@@ -70,6 +89,23 @@ pub struct Renderer {
     bond_iters: u64,
     bond_break_speed_milli: u64,
     bond_break_error_milli: u64,
+    spawn_randomize: bool,
+    init_randomize: bool,
+    link_radius_to_mass: bool,
+    mass_min_milli: u64,
+    mass_max_milli: u64,
+    diam_min_milli: u64,
+    diam_max_milli: u64,
+    vel_filter_alpha_milli: u64,
+    vel_filter_contacts_only: bool,
+    vel_filter_min_contacts: u64,
+
+    clump_damp_enabled: bool,
+    clump_damp_contacts_only: bool,
+    clump_damp_min_contacts: u64,
+    clump_damp_speed_milli: u64,
+    clump_damp_e_low_milli: u64,
+    clump_damp_e_high_milli: u64,
 
     spawn_body: Option<Body>,
     angle: Option<f32>,
@@ -133,6 +169,23 @@ impl quarkstrom::Renderer for Renderer {
             bond_iters: BOND_ITERS.load(Ordering::Relaxed),
             bond_break_speed_milli: BOND_BREAK_SPEED.load(Ordering::Relaxed),
             bond_break_error_milli: BOND_BREAK_ERROR.load(Ordering::Relaxed),
+            spawn_randomize: SPAWN_RANDOMIZE.load(Ordering::Relaxed),
+            init_randomize: INIT_RANDOMIZE.load(Ordering::Relaxed),
+            link_radius_to_mass: LINK_RADIUS_TO_MASS.load(Ordering::Relaxed),
+            mass_min_milli: MASS_MIN_MILLI.load(Ordering::Relaxed),
+            mass_max_milli: MASS_MAX_MILLI.load(Ordering::Relaxed),
+            diam_min_milli: DIAM_MIN_MILLI.load(Ordering::Relaxed),
+            diam_max_milli: DIAM_MAX_MILLI.load(Ordering::Relaxed),
+            vel_filter_alpha_milli: VEL_FILTER_ALPHA_MILLI.load(Ordering::Relaxed),
+            vel_filter_contacts_only: VEL_FILTER_CONTACTS_ONLY.load(Ordering::Relaxed),
+            vel_filter_min_contacts: VEL_FILTER_MIN_CONTACTS.load(Ordering::Relaxed),
+
+            clump_damp_enabled: CLUMP_DAMP_ENABLED.load(Ordering::Relaxed),
+            clump_damp_contacts_only: CLUMP_DAMP_CONTACTS_ONLY.load(Ordering::Relaxed),
+            clump_damp_min_contacts: CLUMP_DAMP_MIN_CONTACTS.load(Ordering::Relaxed),
+            clump_damp_speed_milli: CLUMP_DAMP_SPEED_MILLI.load(Ordering::Relaxed),
+            clump_damp_e_low_milli: CLUMP_DAMP_E_LOW_MILLI.load(Ordering::Relaxed),
+            clump_damp_e_high_milli: CLUMP_DAMP_E_HIGH_MILLI.load(Ordering::Relaxed),
 
             spawn_body: None,
             angle: None,
@@ -222,7 +275,39 @@ impl quarkstrom::Renderer for Renderer {
         } else if input.mouse_pressed(1) {
             let mouse = world_mouse();
             let id = NEXT_BODY_ID.fetch_add(1, Ordering::Relaxed);
-            self.spawn_body = Some(Body::new(id, mouse, Vec2::zero(), 1.0, 1.0));
+            let (mut min_mass, mut max_mass) = (self.mass_min_milli, self.mass_max_milli);
+            if min_mass > max_mass {
+                std::mem::swap(&mut min_mass, &mut max_mass);
+            }
+            let (mut min_diam, mut max_diam) = (self.diam_min_milli, self.diam_max_milli);
+            if min_diam > max_diam {
+                std::mem::swap(&mut min_diam, &mut max_diam);
+            }
+
+            let mass = if self.spawn_randomize {
+                let lo = (min_mass as f32) / 1000.0;
+                let hi = (max_mass as f32) / 1000.0;
+                if lo >= hi {
+                    lo.max(f32::MIN_POSITIVE)
+                } else {
+                    (lo + fastrand::f32() * (hi - lo)).max(f32::MIN_POSITIVE)
+                }
+            } else {
+                1.0
+            };
+
+            let radius = if self.link_radius_to_mass {
+                mass.cbrt()
+            } else if self.spawn_randomize {
+                let lo = (min_diam as f32) / 1000.0;
+                let hi = (max_diam as f32) / 1000.0;
+                let diam = if lo >= hi { lo } else { lo + fastrand::f32() * (hi - lo) };
+                (diam * 0.5).max(0.01)
+            } else {
+                1.0
+            };
+
+            self.spawn_body = Some(Body::new(id, mouse, Vec2::zero(), mass, radius));
             self.angle = None;
             self.total = Some(0.0);
         } else if input.mouse_held(1) {
@@ -242,7 +327,9 @@ impl quarkstrom::Renderer for Renderer {
                     let angle = d.y.atan2(d.x);
                     self.angle = Some(angle);
                 }
-                body.radius = body.mass.cbrt();
+                if self.link_radius_to_mass {
+                    body.radius = body.mass.cbrt();
+                }
                 body.vel = mouse - body.pos;
             }
         } else if input.mouse_released(1) {
@@ -474,6 +561,92 @@ impl quarkstrom::Renderer for Renderer {
                         .text("Frame Delay (ms)"),
                 );
                 FRAME_DELAY_MS.store(self.frame_delay_ms, Ordering::Relaxed);
+
+                ui.separator();
+                ui.label("Particles");
+                ui.checkbox(&mut self.spawn_randomize, "Randomize Spawn");
+                SPAWN_RANDOMIZE.store(self.spawn_randomize, Ordering::Relaxed);
+                ui.checkbox(&mut self.init_randomize, "Randomize On Reset");
+                INIT_RANDOMIZE.store(self.init_randomize, Ordering::Relaxed);
+
+                ui.checkbox(&mut self.link_radius_to_mass, "Link Radius to Mass");
+                LINK_RADIUS_TO_MASS.store(self.link_radius_to_mass, Ordering::Relaxed);
+
+                ui.add(egui::Slider::new(&mut self.mass_min_milli, 1..=1_000_000).text("Mass Min (milli)"));
+                ui.add(egui::Slider::new(&mut self.mass_max_milli, 1..=1_000_000).text("Mass Max (milli)"));
+                MASS_MIN_MILLI.store(self.mass_min_milli, Ordering::Relaxed);
+                MASS_MAX_MILLI.store(self.mass_max_milli, Ordering::Relaxed);
+                ui.label(format!(
+                    "mass range [{:.3}, {:.3}]",
+                    self.mass_min_milli.min(self.mass_max_milli) as f32 / 1000.0,
+                    self.mass_min_milli.max(self.mass_max_milli) as f32 / 1000.0
+                ));
+
+                ui.add(
+                    egui::Slider::new(&mut self.diam_min_milli, 10..=50_000).text("Diameter Min (milli)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.diam_max_milli, 10..=50_000).text("Diameter Max (milli)"),
+                );
+                DIAM_MIN_MILLI.store(self.diam_min_milli, Ordering::Relaxed);
+                DIAM_MAX_MILLI.store(self.diam_max_milli, Ordering::Relaxed);
+                ui.label(format!(
+                    "diam range [{:.3}, {:.3}]",
+                    self.diam_min_milli.min(self.diam_max_milli) as f32 / 1000.0,
+                    self.diam_min_milli.max(self.diam_max_milli) as f32 / 1000.0
+                ));
+
+                ui.separator();
+                ui.label("Collision Velocity Filter");
+                ui.add(
+                    egui::Slider::new(&mut self.vel_filter_alpha_milli, 0..=1000)
+                        .text("Alpha (milli, 1000=no filter)"),
+                );
+                VEL_FILTER_ALPHA_MILLI.store(self.vel_filter_alpha_milli, Ordering::Relaxed);
+                ui.checkbox(&mut self.vel_filter_contacts_only, "Contacts Only");
+                VEL_FILTER_CONTACTS_ONLY.store(self.vel_filter_contacts_only, Ordering::Relaxed);
+                ui.add(egui::Slider::new(&mut self.vel_filter_min_contacts, 0..=32).text("Min Contacts"));
+                VEL_FILTER_MIN_CONTACTS.store(self.vel_filter_min_contacts, Ordering::Relaxed);
+                ui.label(format!(
+                    "alpha {:.3}",
+                    self.vel_filter_alpha_milli as f32 / 1000.0
+                ));
+
+                ui.separator();
+                ui.label("Clump Damping (low-speed contacts)");
+                ui.checkbox(&mut self.clump_damp_enabled, "Enabled");
+                CLUMP_DAMP_ENABLED.store(self.clump_damp_enabled, Ordering::Relaxed);
+                ui.checkbox(&mut self.clump_damp_contacts_only, "Contacts Only");
+                CLUMP_DAMP_CONTACTS_ONLY.store(self.clump_damp_contacts_only, Ordering::Relaxed);
+                ui.add(
+                    egui::Slider::new(&mut self.clump_damp_min_contacts, 0..=32)
+                        .text("Min Contacts"),
+                );
+                CLUMP_DAMP_MIN_CONTACTS.store(self.clump_damp_min_contacts, Ordering::Relaxed);
+                ui.add(
+                    egui::Slider::new(&mut self.clump_damp_speed_milli, 0..=20_000)
+                        .text("Speed Threshold (milli units/s)"),
+                );
+                CLUMP_DAMP_SPEED_MILLI.store(self.clump_damp_speed_milli, Ordering::Relaxed);
+                ui.label(format!(
+                    "threshold {:.3} units/s",
+                    self.clump_damp_speed_milli as f32 / 1000.0
+                ));
+                ui.add(
+                    egui::Slider::new(&mut self.clump_damp_e_low_milli, 0..=1000)
+                        .text("Restitution Low (milli)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.clump_damp_e_high_milli, 0..=1000)
+                        .text("Restitution High (milli)"),
+                );
+                CLUMP_DAMP_E_LOW_MILLI.store(self.clump_damp_e_low_milli, Ordering::Relaxed);
+                CLUMP_DAMP_E_HIGH_MILLI.store(self.clump_damp_e_high_milli, Ordering::Relaxed);
+                ui.label(format!(
+                    "e [{:.3}, {:.3}]",
+                    self.clump_damp_e_low_milli.min(self.clump_damp_e_high_milli) as f32 / 1000.0,
+                    self.clump_damp_e_low_milli.max(self.clump_damp_e_high_milli) as f32 / 1000.0
+                ));
 
                 ui.separator();
                 ui.label("Clumps");

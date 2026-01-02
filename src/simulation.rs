@@ -25,6 +25,7 @@ pub struct Simulation {
     pub metrics: Metrics,
     contacts: HashMap<(u64, u64), Contact>,
     bonds: HashMap<(u64, u64), Bond>,
+    vel_prev: Vec<Vec2>,
 }
 
 impl Simulation {
@@ -35,7 +36,32 @@ impl Simulation {
         let leaf_capacity = 16;
         let thread_capacity = 1024;
 
-        let bodies: Vec<Body> = utils::uniform_disc(n);
+        let init_randomize =
+            crate::renderer::INIT_RANDOMIZE.load(std::sync::atomic::Ordering::Relaxed);
+        let link_radius_to_mass =
+            crate::renderer::LINK_RADIUS_TO_MASS.load(std::sync::atomic::Ordering::Relaxed);
+        let mass_min =
+            crate::renderer::MASS_MIN_MILLI.load(std::sync::atomic::Ordering::Relaxed) as f32
+                / 1000.0;
+        let mass_max =
+            crate::renderer::MASS_MAX_MILLI.load(std::sync::atomic::Ordering::Relaxed) as f32
+                / 1000.0;
+        let diam_min =
+            crate::renderer::DIAM_MIN_MILLI.load(std::sync::atomic::Ordering::Relaxed) as f32
+                / 1000.0;
+        let diam_max =
+            crate::renderer::DIAM_MAX_MILLI.load(std::sync::atomic::Ordering::Relaxed) as f32
+                / 1000.0;
+
+        let randomize = init_randomize.then_some(utils::RandomizeConfig {
+            mass_min,
+            mass_max,
+            diam_min,
+            diam_max,
+            link_radius_to_mass,
+        });
+
+        let bodies: Vec<Body> = utils::uniform_disc(n, randomize);
         let quadtree = Quadtree::new(theta, epsilon, leaf_capacity, thread_capacity);
 
         Self {
@@ -46,6 +72,7 @@ impl Simulation {
             metrics: Metrics::default(),
             contacts: HashMap::new(),
             bonds: HashMap::new(),
+            vel_prev: Vec::new(),
         }
     }
 
@@ -139,6 +166,15 @@ impl Simulation {
     }
 
     pub fn collide(&mut self) -> usize {
+        // Snapshot velocities before we apply any collision/bond response this frame. This makes the
+        // "velocity filter" act on collision-induced changes rather than damping gravity/integration.
+        if self.vel_prev.len() != self.bodies.len() {
+            self.vel_prev.resize(self.bodies.len(), Vec2::zero());
+        }
+        for (i, body) in self.bodies.iter().enumerate() {
+            self.vel_prev[i] = body.vel;
+        }
+
         let mut rects = self
             .bodies
             .iter()
@@ -176,6 +212,47 @@ impl Simulation {
         );
 
         let frame = self.frame;
+
+        let vel_alpha_milli = crate::renderer::VEL_FILTER_ALPHA_MILLI
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(1000);
+        let vel_alpha = vel_alpha_milli as f32 / 1000.0;
+        let vel_contacts_only =
+            crate::renderer::VEL_FILTER_CONTACTS_ONLY.load(std::sync::atomic::Ordering::Relaxed);
+        let vel_min_contacts = crate::renderer::VEL_FILTER_MIN_CONTACTS
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(1024) as u16;
+
+        let clump_damp_enabled =
+            crate::renderer::CLUMP_DAMP_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+        let clump_damp_contacts_only =
+            crate::renderer::CLUMP_DAMP_CONTACTS_ONLY.load(std::sync::atomic::Ordering::Relaxed);
+        let clump_damp_min_contacts = crate::renderer::CLUMP_DAMP_MIN_CONTACTS
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(1024) as u16;
+        let clump_speed = crate::renderer::CLUMP_DAMP_SPEED_MILLI
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(1_000_000) as f32
+            / 1000.0;
+        let mut e_low = crate::renderer::CLUMP_DAMP_E_LOW_MILLI
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(1000) as f32
+            / 1000.0;
+        let mut e_high = crate::renderer::CLUMP_DAMP_E_HIGH_MILLI
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(1000) as f32
+            / 1000.0;
+        if e_low > e_high {
+            std::mem::swap(&mut e_low, &mut e_high);
+        }
+
+        let need_contact_counts = (vel_contacts_only && vel_alpha_milli < 1000)
+            || (clump_damp_enabled && clump_damp_contacts_only);
+        let mut contact_counts: Vec<u16> = if need_contact_counts {
+            vec![0; self.bodies.len()]
+        } else {
+            Vec::new()
+        };
 
         let bond_enabled =
             crate::renderer::BONDS_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
@@ -255,6 +332,13 @@ impl Simulation {
                 .retain(|_, c| frame.saturating_sub(c.last_frame) <= 1);
         }
 
+        if !contact_counts.is_empty() {
+            for &(i, j) in &pairs {
+                contact_counts[i] = contact_counts[i].saturating_add(1);
+                contact_counts[j] = contact_counts[j].saturating_add(1);
+            }
+        }
+
         // Add bonds, capped per body.
         if bond_enabled && max_bonds_per_body > 0 && !bond_candidates.is_empty() {
             let mut bond_count = HashMap::<u64, u8>::new();
@@ -303,18 +387,44 @@ impl Simulation {
                 continue;
             }
 
+            let restitution = if clump_damp_enabled && clump_speed > 0.0 {
+                let p1 = self.bodies[i].pos;
+                let p2 = self.bodies[j].pos;
+                let d = p2 - p1;
+                let len = d.mag();
+                let rel_v = self.bodies[j].vel - self.bodies[i].vel;
+                let rel_n = if len > f32::MIN_POSITIVE {
+                    (rel_v.dot(d / len)).abs()
+                } else {
+                    rel_v.mag()
+                };
+                let in_clump = !clump_damp_contacts_only
+                    || (!contact_counts.is_empty()
+                        && contact_counts[i] >= clump_damp_min_contacts
+                        && contact_counts[j] >= clump_damp_min_contacts);
+
+                if in_clump && rel_n < clump_speed {
+                    let t = (rel_n / clump_speed).clamp(0.0, 1.0);
+                    e_low + (e_high - e_low) * t
+                } else {
+                    e_high
+                }
+            } else {
+                e_high
+            };
+
             if bond_enabled {
                 if self.bonds.contains_key(&key) {
                     let rel_v = (self.bodies[j].vel - self.bodies[i].vel).mag();
                     if bond_break_speed > 0.0 && rel_v >= bond_break_speed {
                         bonds_to_break.push(key);
-                        self.resolve(i, j);
+                        self.resolve_with_restitution(i, j, e_high);
                     }
                     continue;
                 }
             }
 
-            self.resolve(i, j);
+            self.resolve_with_restitution(i, j, restitution);
         }
 
         for key in bonds_to_break {
@@ -331,7 +441,41 @@ impl Simulation {
             self.solve_bonds(bond_iters);
         }
 
+        self.apply_velocity_filter(vel_alpha, vel_contacts_only, vel_min_contacts, &contact_counts);
+
         pairs.len()
+    }
+
+    fn apply_velocity_filter(
+        &mut self,
+        alpha: f32,
+        contacts_only: bool,
+        min_contacts: u16,
+        contact_counts: &[u16],
+    ) {
+        // Filter is applied as a scale on the collision-induced velocity change:
+        //   v <- v_before_collisions + alpha * (v_after - v_before_collisions)
+        // This avoids canceling gravity when the filter is applied globally.
+        let alpha = alpha.clamp(0.0, 1.0);
+        for (index, body) in self.bodies.iter_mut().enumerate() {
+            let base = self.vel_prev.get(index).copied().unwrap_or(body.vel);
+
+            if contacts_only && !contact_counts.is_empty() && contact_counts[index] < min_contacts {
+                continue;
+            }
+
+            let cur = body.vel;
+            if alpha >= 1.0 {
+                continue;
+            }
+            if alpha <= 0.0 {
+                body.vel = base;
+                continue;
+            }
+
+            let next = base + (cur - base) * alpha;
+            body.vel = next;
+        }
     }
 
     fn solve_bonds(&mut self, iters: u32) {
@@ -400,7 +544,7 @@ impl Simulation {
         }
     }
 
-    fn resolve(&mut self, i: usize, j: usize) {
+    fn resolve_with_restitution(&mut self, i: usize, j: usize, restitution: f32) {
         let b1 = &self.bodies[i];
         let b2 = &self.bodies[j];
 
@@ -452,7 +596,8 @@ impl Simulation {
         let d_dot_v = d.dot(v);
         let d_sq = d.mag_sq();
 
-        let tmp = d * (1.5 * d_dot_v / d_sq);
+        let restitution = restitution.clamp(0.0, 1.0);
+        let tmp = d * ((1.0 + restitution) * d_dot_v / d_sq);
         let v1 = v1 + tmp * weight1;
         let v2 = v2 - tmp * weight2;
 
