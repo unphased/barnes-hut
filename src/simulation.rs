@@ -2,6 +2,7 @@ use crate::{body::Body, metrics::Metrics, quadtree::Quadtree, utils};
 
 use broccoli::aabb::Rect;
 use broccoli_rayon::{build::RayonBuildPar, prelude::RayonQueryPar};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use ultraviolet::Vec2;
@@ -15,6 +16,13 @@ struct Contact {
 #[derive(Clone, Copy, Debug, Default)]
 struct Bond {
     rest_len: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CollisionStats {
+    pub pairs: usize,
+    pub islands: usize,
+    pub max_island_pairs: usize,
 }
 
 pub struct Simulation {
@@ -84,9 +92,11 @@ impl Simulation {
         self.metrics.snapshot_mut().last.iterate = start.elapsed();
 
         let start = Instant::now();
-        let collision_pairs = self.collide();
+        let collision = self.collide();
         self.metrics.snapshot_mut().last.collide = start.elapsed();
-        self.metrics.snapshot_mut().counts_last.collision_pairs = collision_pairs;
+        self.metrics.snapshot_mut().counts_last.collision_pairs = collision.pairs;
+        self.metrics.snapshot_mut().counts_last.collision_islands = collision.islands;
+        self.metrics.snapshot_mut().counts_last.collision_island_max_pairs = collision.max_island_pairs;
 
         let start = Instant::now();
         self.attract();
@@ -165,7 +175,7 @@ impl Simulation {
         }
     }
 
-    pub fn collide(&mut self) -> usize {
+    pub fn collide(&mut self) -> CollisionStats {
         // Snapshot velocities before we apply any collision/bond response this frame. This makes the
         // "velocity filter" act on collision-induced changes rather than damping gravity/integration.
         if self.vel_prev.len() != self.bodies.len() {
@@ -376,8 +386,16 @@ impl Simulation {
             }
         }
 
-        // Resolve collisions (skip pairs fused or directly bonded).
+        #[derive(Clone, Copy)]
+        struct ResolveJob {
+            i: usize,
+            j: usize,
+            fixed_restitution: Option<f32>,
+        }
+
+        // Create resolve jobs (skip pairs fused or directly bonded).
         let mut bonds_to_break = Vec::<(u64, u64)>::new();
+        let mut jobs = Vec::<ResolveJob>::with_capacity(pairs.len());
         for &(i, j) in &pairs {
             let a = self.bodies[i].id;
             let b = self.bodies[j].id;
@@ -387,44 +405,90 @@ impl Simulation {
                 continue;
             }
 
-            let restitution = if clump_damp_enabled && clump_speed > 0.0 {
-                let p1 = self.bodies[i].pos;
-                let p2 = self.bodies[j].pos;
-                let d = p2 - p1;
-                let len = d.mag();
-                let rel_v = self.bodies[j].vel - self.bodies[i].vel;
-                let rel_n = if len > f32::MIN_POSITIVE {
-                    (rel_v.dot(d / len)).abs()
-                } else {
-                    rel_v.mag()
-                };
-                let in_clump = !clump_damp_contacts_only
-                    || (!contact_counts.is_empty()
-                        && contact_counts[i] >= clump_damp_min_contacts
-                        && contact_counts[j] >= clump_damp_min_contacts);
-
-                if in_clump && rel_n < clump_speed {
-                    let t = (rel_n / clump_speed).clamp(0.0, 1.0);
-                    e_low + (e_high - e_low) * t
-                } else {
-                    e_high
-                }
-            } else {
-                e_high
-            };
-
             if bond_enabled {
                 if self.bonds.contains_key(&key) {
                     let rel_v = (self.bodies[j].vel - self.bodies[i].vel).mag();
                     if bond_break_speed > 0.0 && rel_v >= bond_break_speed {
                         bonds_to_break.push(key);
-                        self.resolve_with_restitution(i, j, e_high);
+                        jobs.push(ResolveJob {
+                            i,
+                            j,
+                            fixed_restitution: Some(e_high),
+                        });
                     }
                     continue;
                 }
             }
 
-            self.resolve_with_restitution(i, j, restitution);
+            jobs.push(ResolveJob {
+                i,
+                j,
+                fixed_restitution: None,
+            });
+        }
+
+        let mut stats = CollisionStats {
+            pairs: pairs.len(),
+            islands: 0,
+            max_island_pairs: 0,
+        };
+
+        if !jobs.is_empty() {
+            let mut uf = UnionFind::new(self.bodies.len());
+            for job in &jobs {
+                uf.union(job.i, job.j);
+            }
+
+            let mut islands = HashMap::<usize, Vec<ResolveJob>>::new();
+            islands.reserve(jobs.len() / 4 + 1);
+            for job in jobs {
+                let root = uf.find(job.i);
+                islands.entry(root).or_default().push(job);
+            }
+
+            stats.islands = islands.len();
+            stats.max_island_pairs = islands.values().map(|v| v.len()).max().unwrap_or(0);
+
+            let islands: Vec<Vec<ResolveJob>> = islands.into_values().collect();
+
+            let bodies_ptr = self.bodies.as_mut_ptr() as usize;
+            let bodies_len = self.bodies.len();
+
+            islands.par_iter().for_each(|island| unsafe {
+                let bodies_ptr = bodies_ptr as *mut Body;
+                for job in island {
+                    let restitution = if let Some(e) = job.fixed_restitution {
+                        e
+                    } else if clump_damp_enabled && clump_speed > 0.0 {
+                        let b1 = std::ptr::read(bodies_ptr.add(job.i));
+                        let b2 = std::ptr::read(bodies_ptr.add(job.j));
+
+                        let d = b2.pos - b1.pos;
+                        let len = d.mag();
+                        let rel_v = b2.vel - b1.vel;
+                        let rel_n = if len > f32::MIN_POSITIVE {
+                            (rel_v.dot(d / len)).abs()
+                        } else {
+                            rel_v.mag()
+                        };
+                        let in_clump = !clump_damp_contacts_only
+                            || (!contact_counts.is_empty()
+                                && contact_counts[job.i] >= clump_damp_min_contacts
+                                && contact_counts[job.j] >= clump_damp_min_contacts);
+
+                        if in_clump && rel_n < clump_speed {
+                            let t = (rel_n / clump_speed).clamp(0.0, 1.0);
+                            e_low + (e_high - e_low) * t
+                        } else {
+                            e_high
+                        }
+                    } else {
+                        e_high
+                    };
+
+                    Self::resolve_pair_ptr(bodies_ptr, bodies_len, job.i, job.j, restitution);
+                }
+            });
         }
 
         for key in bonds_to_break {
@@ -443,7 +507,7 @@ impl Simulation {
 
         self.apply_velocity_filter(vel_alpha, vel_contacts_only, vel_min_contacts, &contact_counts);
 
-        pairs.len()
+        stats
     }
 
     fn apply_velocity_filter(
@@ -544,9 +608,19 @@ impl Simulation {
         }
     }
 
-    fn resolve_with_restitution(&mut self, i: usize, j: usize, restitution: f32) {
-        let b1 = &self.bodies[i];
-        let b2 = &self.bodies[j];
+    unsafe fn resolve_pair_ptr(
+        bodies_ptr: *mut Body,
+        bodies_len: usize,
+        i: usize,
+        j: usize,
+        restitution: f32,
+    ) {
+        if i >= bodies_len || j >= bodies_len || i == j {
+            return;
+        }
+
+        let b1 = std::ptr::read(bodies_ptr.add(i));
+        let b2 = std::ptr::read(bodies_ptr.add(j));
 
         let p1 = b1.pos;
         let p2 = b2.pos;
@@ -576,8 +650,12 @@ impl Simulation {
 
         if d_dot_v >= 0.0 && d != Vec2::zero() {
             let tmp = d * (r / d.mag() - 1.0);
-            self.bodies[i].pos -= weight1 * tmp;
-            self.bodies[j].pos += weight2 * tmp;
+            let mut out1 = b1;
+            let mut out2 = b2;
+            out1.pos -= weight1 * tmp;
+            out2.pos += weight2 * tmp;
+            std::ptr::write(bodies_ptr.add(i), out1);
+            std::ptr::write(bodies_ptr.add(j), out2);
             return;
         }
 
@@ -587,11 +665,13 @@ impl Simulation {
 
         let t = (d_dot_v + (d_dot_v * d_dot_v - v_sq * (d_sq - r_sq)).max(0.0).sqrt()) / v_sq;
 
-        self.bodies[i].pos -= v1 * t;
-        self.bodies[j].pos -= v2 * t;
+        let mut out1 = b1;
+        let mut out2 = b2;
+        out1.pos -= v1 * t;
+        out2.pos -= v2 * t;
 
-        let p1 = self.bodies[i].pos;
-        let p2 = self.bodies[j].pos;
+        let p1 = out1.pos;
+        let p2 = out2.pos;
         let d = p2 - p1;
         let d_dot_v = d.dot(v);
         let d_sq = d.mag_sq();
@@ -601,10 +681,13 @@ impl Simulation {
         let v1 = v1 + tmp * weight1;
         let v2 = v2 - tmp * weight2;
 
-        self.bodies[i].vel = v1;
-        self.bodies[j].vel = v2;
-        self.bodies[i].pos += v1 * t;
-        self.bodies[j].pos += v2 * t;
+        out1.vel = v1;
+        out2.vel = v2;
+        out1.pos += v1 * t;
+        out2.pos += v2 * t;
+
+        std::ptr::write(bodies_ptr.add(i), out1);
+        std::ptr::write(bodies_ptr.add(j), out2);
     }
 
     fn fuse_contacts(&mut self, pairs: Vec<(usize, usize)>) {

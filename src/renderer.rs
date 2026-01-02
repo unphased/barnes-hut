@@ -774,6 +774,16 @@ impl quarkstrom::Renderer for Renderer {
                     ui.label(format!("{}", c_avg.collision_pairs));
                     ui.end_row();
 
+                    ui.label("collision islands");
+                    ui.label(format!("{}", c_last.collision_islands));
+                    ui.label(format!("{}", c_avg.collision_islands));
+                    ui.end_row();
+
+                    ui.label("max island pairs");
+                    ui.label(format!("{}", c_last.collision_island_max_pairs));
+                    ui.label(format!("{}", c_avg.collision_island_max_pairs));
+                    ui.end_row();
+
                     ui.label("bonds");
                     ui.label(format!("{}", c_last.bonds));
                     ui.label(format!("{}", c_avg.bonds));
