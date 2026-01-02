@@ -268,8 +268,8 @@ impl quarkstrom::Renderer for Renderer {
 
         if let Some(id) = self.follow_id {
             if let Some(body) = self.bodies.iter().find(|b| b.id == id) {
-                // Keep the followed body centered immediately (no per-step "whiplash").
-                self.pos = body.pos;
+                // Smooth follow a bit to reduce jitter.
+                self.pos = self.pos * 0.85 + body.pos * 0.15;
             } else {
                 self.follow_id = None;
             }
