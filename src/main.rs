@@ -22,13 +22,15 @@ fn main() {
         window_mode: quarkstrom::WindowMode::Windowed(900, 900),
     };
 
-    let mut simulation = Simulation::new();
+    let init_particles = renderer::INIT_PARTICLES.load(Ordering::Relaxed) as usize;
+    let mut simulation = Simulation::new(init_particles);
     renderer::NEXT_BODY_ID.store(simulation.bodies.len() as u64, Ordering::Relaxed);
 
     std::thread::spawn(move || {
 	    loop {
             if renderer::RESET_REQUESTED.swap(false, Ordering::Relaxed) {
-                simulation = Simulation::new();
+                let init_particles = renderer::INIT_PARTICLES.load(Ordering::Relaxed) as usize;
+                simulation = Simulation::new(init_particles);
                 renderer::NEXT_BODY_ID.store(simulation.bodies.len() as u64, Ordering::Relaxed);
                 renderer::SPAWN.lock().clear();
             }
@@ -65,6 +67,16 @@ fn render(simulation: &mut Simulation) {
         lock.clear();
         if renderer::WANT_QUADTREE.load(Ordering::Relaxed) {
             lock.extend_from_slice(&simulation.quadtree.nodes);
+        }
+    }
+    {
+        let mut lock = renderer::BOND_LINES.lock();
+        lock.clear();
+        if renderer::WANT_BONDS.load(Ordering::Relaxed) {
+            let max_lines = renderer::MAX_BOND_LINES
+                .load(Ordering::Relaxed)
+                .min(200000) as usize;
+            lock.extend(simulation.bond_lines(max_lines));
         }
     }
     {

@@ -27,6 +27,7 @@ pub static NEXT_BODY_ID: Lazy<AtomicU64> = Lazy::new(|| 0.into());
 pub static FUSE_ENABLED: Lazy<AtomicBool> = Lazy::new(|| false.into());
 pub static FUSE_AFTER_FRAMES: Lazy<AtomicU64> = Lazy::new(|| 20.into());
 pub static RESET_REQUESTED: Lazy<AtomicBool> = Lazy::new(|| false.into());
+pub static INIT_PARTICLES: Lazy<AtomicU64> = Lazy::new(|| 200_000.into());
 
 pub static BONDS_ENABLED: Lazy<AtomicBool> = Lazy::new(|| true.into());
 pub static BOND_AFTER_FRAMES: Lazy<AtomicU64> = Lazy::new(|| 15.into());
@@ -39,21 +40,28 @@ pub static BODIES: Lazy<Mutex<Vec<Body>>> = Lazy::new(|| Mutex::new(Vec::new()))
 pub static QUADTREE: Lazy<Mutex<Vec<Node>>> = Lazy::new(|| Mutex::new(Vec::new()));
 pub static METRICS: Lazy<Mutex<MetricsSnapshot>> = Lazy::new(|| Mutex::new(MetricsSnapshot::default()));
 pub static WANT_QUADTREE: Lazy<AtomicBool> = Lazy::new(|| false.into());
+pub static WANT_BONDS: Lazy<AtomicBool> = Lazy::new(|| false.into());
+pub static MAX_BOND_LINES: Lazy<AtomicU64> = Lazy::new(|| 20000.into());
+pub static BOND_LINE_PX: Lazy<AtomicU64> = Lazy::new(|| 3.into());
+pub static BOND_LINES: Lazy<Mutex<Vec<(Vec2, Vec2)>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 pub static SPAWN: Lazy<Mutex<Vec<Body>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 pub struct Renderer {
     pos: Vec2,
     scale: f32,
+    viewport_height: u16,
 
     settings_window_open: bool,
 
     show_bodies: bool,
     use_random_colors: bool,
     show_quadtree: bool,
+    show_bonds: bool,
 
     depth_range: (usize, usize),
     frame_delay_ms: u64,
+    init_particles: u64,
     fuse_enabled: bool,
     fuse_after_frames: u64,
     bonds_enabled: bool,
@@ -71,7 +79,13 @@ pub struct Renderer {
 
     bodies: Vec<Body>,
     quadtree: Vec<Node>,
+    bond_lines: Vec<(Vec2, Vec2)>,
     metrics: MetricsSnapshot,
+
+    bond_line_px: u64,
+
+    click_mode_follow: bool,
+    follow_id: Option<u64>,
 }
 
 fn mix64(mut x: u64) -> u64 {
@@ -99,15 +113,18 @@ impl quarkstrom::Renderer for Renderer {
         Self {
             pos: Vec2::zero(),
             scale: 3600.0,
+            viewport_height: 900,
 
             settings_window_open: false,
 
             show_bodies: true,
             use_random_colors: USE_RANDOM_COLORS.load(Ordering::Relaxed),
             show_quadtree: false,
+            show_bonds: false,
 
             depth_range: (0, 0),
             frame_delay_ms: FRAME_DELAY_MS.load(Ordering::Relaxed),
+            init_particles: INIT_PARTICLES.load(Ordering::Relaxed),
             fuse_enabled: FUSE_ENABLED.load(Ordering::Relaxed),
             fuse_after_frames: FUSE_AFTER_FRAMES.load(Ordering::Relaxed),
             bonds_enabled: BONDS_ENABLED.load(Ordering::Relaxed),
@@ -125,11 +142,18 @@ impl quarkstrom::Renderer for Renderer {
 
             bodies: Vec::new(),
             quadtree: Vec::new(),
+            bond_lines: Vec::new(),
             metrics: MetricsSnapshot::default(),
+
+            bond_line_px: BOND_LINE_PX.load(Ordering::Relaxed),
+
+            click_mode_follow: false,
+            follow_id: None,
         }
     }
 
     fn input(&mut self, input: &WinitInputHelper, width: u16, height: u16) {
+        self.viewport_height = height.max(1);
         self.settings_window_open ^= input.key_pressed(VirtualKeyCode::E);
 
         if input.key_pressed(VirtualKeyCode::Space) {
@@ -148,15 +172,17 @@ impl quarkstrom::Renderer for Renderer {
             let target =
                 Vec2::new(mx * 2.0 - width as f32, height as f32 - my * 2.0) / height as f32;
 
-            // Move view position based on target
-            self.pos += target * self.scale * (1.0 - zoom);
+            // Move view position based on target (unless we're following)
+            if self.follow_id.is_none() {
+                self.pos += target * self.scale * (1.0 - zoom);
+            }
 
             // Zoom
             self.scale *= zoom;
         }
 
         // Grab
-        if input.mouse_held(2) {
+        if input.mouse_held(2) && self.follow_id.is_none() {
             let (mdx, mdy) = input.mouse_diff();
             self.pos.x -= mdx / height as f32 * self.scale * 2.0;
             self.pos.y += mdy / height as f32 * self.scale * 2.0;
@@ -172,7 +198,28 @@ impl quarkstrom::Renderer for Renderer {
             mouse * self.scale + self.pos
         };
 
-        if input.mouse_pressed(1) {
+        if self.click_mode_follow && input.mouse_pressed(0) && !self.bodies.is_empty() {
+            let mouse = world_mouse();
+            let mut best: Option<(u64, f32)> = None;
+            for body in &self.bodies {
+                let d_sq = (body.pos - mouse).mag_sq();
+                match best {
+                    None => best = Some((body.id, d_sq)),
+                    Some((_, best_sq)) if d_sq < best_sq => best = Some((body.id, d_sq)),
+                    _ => {}
+                }
+            }
+
+            // Require a reasonably close click (in screen pixels).
+            let units_per_pixel = self.scale * 2.0 / height.max(1) as f32;
+            let max_dist = units_per_pixel * 12.0;
+            let max_dist_sq = max_dist * max_dist;
+            if let Some((id, d_sq)) = best {
+                if d_sq <= max_dist_sq {
+                    self.follow_id = Some(id);
+                }
+            }
+        } else if input.mouse_pressed(1) {
             let mouse = world_mouse();
             let id = NEXT_BODY_ID.fetch_add(1, Ordering::Relaxed);
             self.spawn_body = Some(Body::new(id, mouse, Vec2::zero(), 1.0, 1.0));
@@ -209,6 +256,7 @@ impl quarkstrom::Renderer for Renderer {
             if *lock {
                 std::mem::swap(&mut self.bodies, &mut BODIES.lock());
                 std::mem::swap(&mut self.quadtree, &mut QUADTREE.lock());
+                std::mem::swap(&mut self.bond_lines, &mut BOND_LINES.lock());
                 self.metrics = *METRICS.lock();
             }
             if let Some(body) = self.confirmed_bodies.take() {
@@ -216,6 +264,15 @@ impl quarkstrom::Renderer for Renderer {
                 SPAWN.lock().push(body);
             }
             *lock = false;
+        }
+
+        if let Some(id) = self.follow_id {
+            if let Some(body) = self.bodies.iter().find(|b| b.id == id) {
+                // Smooth follow a bit to reduce jitter.
+                self.pos = self.pos * 0.85 + body.pos * 0.15;
+            } else {
+                self.follow_id = None;
+            }
         }
 
         ctx.clear_circles();
@@ -234,6 +291,33 @@ impl quarkstrom::Renderer for Renderer {
                         [0xff; 4]
                     };
                     ctx.draw_circle(self.bodies[i].pos, self.bodies[i].radius, color);
+                }
+            }
+
+            if self.show_bonds && !self.bond_lines.is_empty() {
+                let color = [0xff, 0x00, 0xff, 0xff];
+                let thickness_px = self.bond_line_px.max(1) as f32;
+                for &(a, b) in &self.bond_lines {
+                    let d = b - a;
+                    let len = d.mag();
+                    if len <= f32::MIN_POSITIVE {
+                        continue;
+                    }
+
+                    // Quarkstrom renders 1px lines; fake ~2px thickness by drawing two parallel
+                    // segments offset by ~1 pixel in world units.
+                    let units_per_pixel = self.scale * 2.0 / self.viewport_height as f32;
+                    let n = d / len;
+                    let perp = Vec2::new(-n.y, n.x);
+                    let off = perp * units_per_pixel * thickness_px;
+                    ctx.draw_line(a + off, b + off, color);
+                    ctx.draw_line(a - off, b - off, color);
+                }
+            }
+
+            if let Some(id) = self.follow_id {
+                if let Some(body) = self.bodies.iter().find(|b| b.id == id) {
+                    ctx.draw_circle(body.pos, body.radius * 2.0, [0xff, 0xff, 0x00, 0x60]);
                 }
             }
 
@@ -356,11 +440,35 @@ impl quarkstrom::Renderer for Renderer {
                     });
                 }
 
+                if ui.checkbox(&mut self.show_bonds, "Show Bonds").changed() {
+                    WANT_BONDS.store(self.show_bonds, Ordering::Relaxed);
+                }
+                if self.show_bonds {
+                    let mut max_lines = MAX_BOND_LINES.load(Ordering::Relaxed);
+                    ui.add(egui::Slider::new(&mut max_lines, 0..=200000).text("Max Bond Lines"));
+                    MAX_BOND_LINES.store(max_lines, Ordering::Relaxed);
+
+                    ui.add(egui::Slider::new(&mut self.bond_line_px, 1..=12).text("Bond Thickness (px)"));
+                    BOND_LINE_PX.store(self.bond_line_px, Ordering::Relaxed);
+                }
+
                 ui.separator();
                 ui.label("Playback");
+                ui.add(
+                    egui::Slider::new(&mut self.init_particles, 1_000..=2_000_000)
+                        .logarithmic(true)
+                        .text("Init Particles"),
+                );
+                INIT_PARTICLES.store(self.init_particles, Ordering::Relaxed);
                 if ui.button("Reset Simulation").clicked() {
                     RESET_REQUESTED.store(true, Ordering::Relaxed);
                 }
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.click_mode_follow, "Left Click: Follow");
+                    if ui.button("Unfollow").clicked() {
+                        self.follow_id = None;
+                    }
+                });
                 ui.add(
                     egui::Slider::new(&mut self.frame_delay_ms, 0..=500)
                         .text("Frame Delay (ms)"),
@@ -491,6 +599,11 @@ impl quarkstrom::Renderer for Renderer {
                     ui.label("collision pairs");
                     ui.label(format!("{}", c_last.collision_pairs));
                     ui.label(format!("{}", c_avg.collision_pairs));
+                    ui.end_row();
+
+                    ui.label("bonds");
+                    ui.label(format!("{}", c_last.bonds));
+                    ui.label(format!("{}", c_avg.bonds));
                     ui.end_row();
                 });
             });

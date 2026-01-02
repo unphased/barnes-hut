@@ -15,7 +15,6 @@ struct Contact {
 #[derive(Clone, Copy, Debug, Default)]
 struct Bond {
     rest_len: f32,
-    last_frame: usize,
 }
 
 pub struct Simulation {
@@ -29,9 +28,8 @@ pub struct Simulation {
 }
 
 impl Simulation {
-    pub fn new() -> Self {
+    pub fn new(n: usize) -> Self {
         let dt = 0.05;
-        let n = 200000;
         let theta = 1.0;
         let epsilon = 1.0;
         let leaf_capacity = 16;
@@ -69,8 +67,59 @@ impl Simulation {
 
         self.metrics.snapshot_mut().counts_last.bodies = self.bodies.len();
         self.metrics.snapshot_mut().counts_last.quadtree_nodes_active = self.quadtree.active_nodes_len();
+        self.metrics.snapshot_mut().counts_last.bonds = self.bonds.len();
         self.metrics.finish_frame();
         self.frame += 1;
+    }
+
+    pub fn bond_lines(&self, max_lines: usize) -> Vec<(Vec2, Vec2)> {
+        if max_lines == 0 || self.bonds.is_empty() || self.bodies.is_empty() {
+            return Vec::new();
+        }
+
+        let max_id = self.bodies.iter().map(|b| b.id).max().unwrap_or(0) as usize;
+        let use_vec = max_id <= self.bodies.len().saturating_mul(4);
+
+        let mut out = Vec::with_capacity(self.bonds.len().min(max_lines));
+
+        if use_vec {
+            let mut id_to_pos = vec![Vec2::zero(); max_id.saturating_add(1)];
+            for body in &self.bodies {
+                let idx = body.id as usize;
+                if idx < id_to_pos.len() {
+                    id_to_pos[idx] = body.pos;
+                }
+            }
+
+            for (&(a, b), _) in self.bonds.iter() {
+                if out.len() >= max_lines {
+                    break;
+                }
+                let ai = a as usize;
+                let bi = b as usize;
+                if ai >= id_to_pos.len() || bi >= id_to_pos.len() {
+                    continue;
+                }
+                out.push((id_to_pos[ai], id_to_pos[bi]));
+            }
+        } else {
+            let mut id_to_pos = HashMap::<u64, Vec2>::with_capacity(self.bodies.len());
+            for body in &self.bodies {
+                id_to_pos.insert(body.id, body.pos);
+            }
+
+            for (&(a, b), _) in self.bonds.iter() {
+                if out.len() >= max_lines {
+                    break;
+                }
+                let (Some(&p1), Some(&p2)) = (id_to_pos.get(&a), id_to_pos.get(&b)) else {
+                    continue;
+                };
+                out.push((p1, p2));
+            }
+        }
+
+        out
     }
 
     pub fn attract(&mut self) {
@@ -90,41 +139,15 @@ impl Simulation {
     }
 
     pub fn collide(&mut self) -> usize {
-        let mut rects = self
-            .bodies
-            .iter()
-            .enumerate()
-            .map(|(index, body)| {
-                let pos = body.pos;
-                let radius = body.radius;
-                let min = pos - Vec2::one() * radius;
-                let max = pos + Vec2::one() * radius;
-                (Rect::new(min.x, max.x, min.y, max.y), index)
-            })
-            .collect::<Vec<_>>();
+        let bond_enabled =
+            crate::renderer::BONDS_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+        let use_component_mode = bond_enabled && self.bonds.len() >= 512;
 
-        let mut broccoli = broccoli::Tree::par_new(&mut rects);
-
-        let bodies_ptr = self.bodies.as_ptr() as usize;
-        let bodies_len = self.bodies.len();
-        let pairs = broccoli.par_find_colliding_pairs_acc_closure(
-            Vec::<(usize, usize)>::new(),
-            |_| Vec::<(usize, usize)>::new(),
-            |acc, mut b| acc.append(&mut b),
-            |acc, i, j| {
-                let i = *i.unpack_inner();
-                let j = *j.unpack_inner();
-
-                let bodies = unsafe { std::slice::from_raw_parts(bodies_ptr as *const Body, bodies_len) };
-                let b1 = bodies[i];
-                let b2 = bodies[j];
-                let d = b2.pos - b1.pos;
-                let r = b1.radius + b2.radius;
-                if d.mag_sq() <= r * r {
-                    acc.push((i, j));
-                }
-            },
-        );
+        let pairs = if use_component_mode {
+            self.collect_pairs_component()
+        } else {
+            self.collect_pairs_global()
+        };
 
         let frame = self.frame;
 
@@ -133,7 +156,6 @@ impl Simulation {
         let bond_steps = crate::renderer::BOND_AFTER_FRAMES
             .load(std::sync::atomic::Ordering::Relaxed)
             .max(1) as u32;
-        let bond_break_speed = crate::renderer::BOND_BREAK_SPEED.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
         let max_bonds_per_body = crate::renderer::MAX_BONDS_PER_BODY
             .load(std::sync::atomic::Ordering::Relaxed)
             .clamp(0, 16) as u8;
@@ -234,10 +256,7 @@ impl Simulation {
                 let rest_len = d.mag().max(min_len);
                 self.bonds.insert(
                     key,
-                    Bond {
-                        rest_len,
-                        last_frame: frame,
-                    },
+                    Bond { rest_len },
                 );
                 *bond_count.entry(a).or_insert(0) += 1;
                 *bond_count.entry(b).or_insert(0) += 1;
@@ -245,7 +264,6 @@ impl Simulation {
         }
 
         // Resolve collisions (skip pairs fused or directly bonded).
-        let mut bonds_to_break = Vec::<(u64, u64)>::new();
         for &(i, j) in &pairs {
             let a = self.bodies[i].id;
             let b = self.bodies[j].id;
@@ -256,23 +274,12 @@ impl Simulation {
             }
 
             if bond_enabled {
-                if let Some(bond) = self.bonds.get_mut(&key) {
-                    bond.last_frame = frame;
-                    let rel_v = (self.bodies[j].vel - self.bodies[i].vel).mag();
-                    if bond_break_speed > 0.0 && rel_v >= bond_break_speed {
-                        bonds_to_break.push(key);
-                        self.resolve(i, j);
-                    }
+                if self.bonds.contains_key(&key) {
                     continue;
                 }
             }
 
             self.resolve(i, j);
-        }
-
-        for key in bonds_to_break {
-            self.bonds.remove(&key);
-            self.contacts.remove(&key);
         }
 
         if fuse_enabled && !fuse_pairs.is_empty() {
@@ -287,11 +294,53 @@ impl Simulation {
         pairs.len()
     }
 
-    fn solve_bonds(&mut self, iters: u32) {
-        let frame = self.frame;
-        let break_error =
-            crate::renderer::BOND_BREAK_ERROR.load(std::sync::atomic::Ordering::Relaxed) as f32
-                / 1000.0;
+    fn collect_pairs_global(&self) -> Vec<(usize, usize)> {
+        let mut rects = self
+            .bodies
+            .iter()
+            .enumerate()
+            .map(|(index, body)| {
+                let pos = body.pos;
+                let radius = body.radius;
+                let min = pos - Vec2::one() * radius;
+                let max = pos + Vec2::one() * radius;
+                (Rect::new(min.x, max.x, min.y, max.y), index)
+            })
+            .collect::<Vec<_>>();
+
+        let mut broccoli = broccoli::Tree::par_new(&mut rects);
+
+        let bodies_ptr = self.bodies.as_ptr() as usize;
+        let bodies_len = self.bodies.len();
+        broccoli.par_find_colliding_pairs_acc_closure(
+            Vec::<(usize, usize)>::new(),
+            |_| Vec::<(usize, usize)>::new(),
+            |acc, mut b| acc.append(&mut b),
+            |acc, i, j| {
+                let i = *i.unpack_inner();
+                let j = *j.unpack_inner();
+
+                let bodies =
+                    unsafe { std::slice::from_raw_parts(bodies_ptr as *const Body, bodies_len) };
+                let b1 = bodies[i];
+                let b2 = bodies[j];
+                let d = b2.pos - b1.pos;
+                let r = b1.radius + b2.radius;
+                if d.mag_sq() <= r * r {
+                    acc.push((i, j));
+                }
+            },
+        )
+    }
+
+    fn collect_pairs_component(&self) -> Vec<(usize, usize)> {
+        // Build connected components from bonds, then only find collisions BETWEEN components
+        // (internal collisions in bonded clumps are handled by the bond solver instead).
+
+        let n = self.bodies.len();
+        if n == 0 || self.bonds.is_empty() {
+            return Vec::new();
+        }
 
         let max_id = self.bodies.iter().map(|b| b.id).max().unwrap_or(0) as usize;
         let mut id_to_index = vec![usize::MAX; max_id.saturating_add(1)];
@@ -299,15 +348,159 @@ impl Simulation {
             id_to_index[body.id as usize] = index;
         }
 
-        let mut to_remove = Vec::<(u64, u64)>::new();
-        // Drop bonds not seen recently.
-        for (&key, bond) in self.bonds.iter() {
-            if frame.saturating_sub(bond.last_frame) > 1 {
-                to_remove.push(key);
+        let mut uf = UnionFind::new(n);
+        for (&(a, b), _) in self.bonds.iter() {
+            let ai = a as usize;
+            let bi = b as usize;
+            if ai >= id_to_index.len() || bi >= id_to_index.len() {
+                continue;
+            }
+            let i = id_to_index[ai];
+            let j = id_to_index[bi];
+            if i == usize::MAX || j == usize::MAX {
+                continue;
+            }
+            uf.union(i, j);
+        }
+
+        let mut root_to_comp = vec![usize::MAX; n];
+        let mut comp_of_body = vec![0usize; n];
+        let mut comp_min = Vec::<Vec2>::new();
+        let mut comp_max = Vec::<Vec2>::new();
+
+        for (i, body) in self.bodies.iter().enumerate() {
+            let root = uf.find(i);
+            let mut comp = root_to_comp[root];
+            if comp == usize::MAX {
+                comp = comp_min.len();
+                root_to_comp[root] = comp;
+                let r = Vec2::one() * body.radius;
+                comp_min.push(body.pos - r);
+                comp_max.push(body.pos + r);
+            } else {
+                let r = Vec2::one() * body.radius;
+                let min = body.pos - r;
+                let max = body.pos + r;
+                comp_min[comp].x = comp_min[comp].x.min(min.x);
+                comp_min[comp].y = comp_min[comp].y.min(min.y);
+                comp_max[comp].x = comp_max[comp].x.max(max.x);
+                comp_max[comp].y = comp_max[comp].y.max(max.y);
+            }
+            comp_of_body[i] = comp;
+        }
+
+        let comp_count = comp_min.len();
+        if comp_count <= 1 {
+            return Vec::new();
+        }
+
+        let mut comp_rects = Vec::with_capacity(comp_count);
+        for comp in 0..comp_count {
+            let min = comp_min[comp];
+            let max = comp_max[comp];
+            comp_rects.push((Rect::new(min.x, max.x, min.y, max.y), comp));
+        }
+
+        let mut comp_tree = broccoli::Tree::par_new(&mut comp_rects);
+        let comp_pairs = comp_tree.par_find_colliding_pairs_acc_closure(
+            Vec::<(usize, usize)>::new(),
+            |_| Vec::<(usize, usize)>::new(),
+            |acc, mut b| acc.append(&mut b),
+            |acc, a, b| {
+                let a = *a.unpack_inner();
+                let b = *b.unpack_inner();
+                if a != b {
+                    acc.push((a.min(b), a.max(b)));
+                }
+            },
+        );
+
+        if comp_pairs.is_empty() {
+            return Vec::new();
+        }
+
+        let mut involved = vec![false; comp_count];
+        for &(a, b) in &comp_pairs {
+            involved[a] = true;
+            involved[b] = true;
+        }
+
+        let mut members = vec![Vec::<usize>::new(); comp_count];
+        for i in 0..n {
+            let comp = comp_of_body[i];
+            if involved[comp] {
+                members[comp].push(i);
             }
         }
-        for key in to_remove.drain(..) {
-            self.bonds.remove(&key);
+
+        let bodies_ptr = self.bodies.as_ptr() as usize;
+        let bodies_len = self.bodies.len();
+
+        let mut out = Vec::<(usize, usize)>::new();
+        for (ca, cb) in comp_pairs {
+            let a_members = &members[ca];
+            let b_members = &members[cb];
+            if a_members.is_empty() || b_members.is_empty() {
+                continue;
+            }
+
+            // Build trees for each component and find cross-collisions only.
+            let mut rects_a = a_members
+                .iter()
+                .map(|&index| {
+                    let body = self.bodies[index];
+                    let r = Vec2::one() * body.radius;
+                    let min = body.pos - r;
+                    let max = body.pos + r;
+                    (Rect::new(min.x, max.x, min.y, max.y), index)
+                })
+                .collect::<Vec<_>>();
+
+            let mut rects_b = b_members
+                .iter()
+                .map(|&index| {
+                    let body = self.bodies[index];
+                    let r = Vec2::one() * body.radius;
+                    let min = body.pos - r;
+                    let max = body.pos + r;
+                    (Rect::new(min.x, max.x, min.y, max.y), index)
+                })
+                .collect::<Vec<_>>();
+
+            let mut tree_a = broccoli::Tree::new(&mut rects_a);
+            let mut tree_b = broccoli::Tree::new(&mut rects_b);
+
+            tree_a.find_colliding_pairs_with(&mut tree_b, |a, b| {
+                let i = *a.unpack_inner();
+                let j = *b.unpack_inner();
+
+                let bodies =
+                    unsafe { std::slice::from_raw_parts(bodies_ptr as *const Body, bodies_len) };
+                let b1 = bodies[i];
+                let b2 = bodies[j];
+                let d = b2.pos - b1.pos;
+                let r = b1.radius + b2.radius;
+                if d.mag_sq() <= r * r {
+                    out.push((i, j));
+                }
+            });
+        }
+
+        out
+    }
+
+    fn solve_bonds(&mut self, iters: u32) {
+        let break_error =
+            crate::renderer::BOND_BREAK_ERROR.load(std::sync::atomic::Ordering::Relaxed) as f32
+                / 1000.0;
+        let break_speed = crate::renderer::BOND_BREAK_SPEED
+            .load(std::sync::atomic::Ordering::Relaxed) as f32
+            / 1000.0;
+
+        let max_id = self.bodies.iter().map(|b| b.id).max().unwrap_or(0) as usize;
+        let mut id_to_index = vec![usize::MAX; max_id.saturating_add(1)];
+        for (index, body) in self.bodies.iter().enumerate() {
+            id_to_index[body.id as usize] = index;
         }
 
         let mut break_list = Vec::<(u64, u64)>::new();
@@ -338,6 +531,13 @@ impl Simulation {
                 if break_error > 0.0 && err.abs() >= break_error {
                     break_list.push((a, b));
                     continue;
+                }
+                if break_speed > 0.0 {
+                    let rel_v = (self.bodies[j].vel - self.bodies[i].vel).mag();
+                    if rel_v >= break_speed {
+                        break_list.push((a, b));
+                        continue;
+                    }
                 }
 
                 let n = d / len;
