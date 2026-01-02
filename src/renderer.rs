@@ -29,6 +29,8 @@ pub static FUSE_AFTER_FRAMES: Lazy<AtomicU64> = Lazy::new(|| 20.into());
 pub static RESET_REQUESTED: Lazy<AtomicBool> = Lazy::new(|| false.into());
 pub static INIT_PARTICLES: Lazy<AtomicU64> = Lazy::new(|| 200_000.into());
 
+pub static COLLISIONS_ENABLED: Lazy<AtomicBool> = Lazy::new(|| true.into());
+
 pub static BONDS_ENABLED: Lazy<AtomicBool> = Lazy::new(|| false.into());
 pub static BOND_AFTER_FRAMES: Lazy<AtomicU64> = Lazy::new(|| 15.into());
 pub static MAX_BONDS_PER_BODY: Lazy<AtomicU64> = Lazy::new(|| 4.into());
@@ -81,6 +83,7 @@ pub struct Renderer {
     depth_range: (usize, usize),
     frame_delay_ms: u64,
     init_particles: u64,
+    collisions_enabled: bool,
     fuse_enabled: bool,
     fuse_after_frames: u64,
     bonds_enabled: bool,
@@ -161,6 +164,7 @@ impl quarkstrom::Renderer for Renderer {
             depth_range: (0, 0),
             frame_delay_ms: FRAME_DELAY_MS.load(Ordering::Relaxed),
             init_particles: INIT_PARTICLES.load(Ordering::Relaxed),
+            collisions_enabled: COLLISIONS_ENABLED.load(Ordering::Relaxed),
             fuse_enabled: FUSE_ENABLED.load(Ordering::Relaxed),
             fuse_after_frames: FUSE_AFTER_FRAMES.load(Ordering::Relaxed),
             bonds_enabled: BONDS_ENABLED.load(Ordering::Relaxed),
@@ -549,6 +553,12 @@ impl quarkstrom::Renderer for Renderer {
                 INIT_PARTICLES.store(self.init_particles, Ordering::Relaxed);
                 if ui.button("Reset Simulation").clicked() {
                     RESET_REQUESTED.store(true, Ordering::Relaxed);
+                }
+                if ui
+                    .checkbox(&mut self.collisions_enabled, "Collisions Enabled")
+                    .changed()
+                {
+                    COLLISIONS_ENABLED.store(self.collisions_enabled, Ordering::Relaxed);
                 }
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.click_mode_follow, "Left Click: Follow");

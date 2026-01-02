@@ -4,7 +4,7 @@ use broccoli::aabb::Rect;
 use broccoli_rayon::{build::RayonBuildPar, prelude::RayonQueryPar};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use ultraviolet::Vec2;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -34,6 +34,7 @@ pub struct Simulation {
     contacts: HashMap<(u64, u64), Contact>,
     bonds: HashMap<(u64, u64), Bond>,
     vel_prev: Vec<Vec2>,
+    collisions_enabled_prev: bool,
 }
 
 impl Simulation {
@@ -81,6 +82,7 @@ impl Simulation {
             contacts: HashMap::new(),
             bonds: HashMap::new(),
             vel_prev: Vec::new(),
+            collisions_enabled_prev: true,
         }
     }
 
@@ -91,12 +93,28 @@ impl Simulation {
         self.iterate();
         self.metrics.snapshot_mut().last.iterate = start.elapsed();
 
-        let start = Instant::now();
-        let collision = self.collide();
-        self.metrics.snapshot_mut().last.collide = start.elapsed();
-        self.metrics.snapshot_mut().counts_last.collision_pairs = collision.pairs;
-        self.metrics.snapshot_mut().counts_last.collision_islands = collision.islands;
-        self.metrics.snapshot_mut().counts_last.collision_island_max_pairs = collision.max_island_pairs;
+        let collisions_enabled =
+            crate::renderer::COLLISIONS_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+        if !collisions_enabled && self.collisions_enabled_prev {
+            self.contacts.clear();
+            self.bonds.clear();
+        }
+        self.collisions_enabled_prev = collisions_enabled;
+
+        if collisions_enabled {
+            let start = Instant::now();
+            let collision = self.collide();
+            self.metrics.snapshot_mut().last.collide = start.elapsed();
+            self.metrics.snapshot_mut().counts_last.collision_pairs = collision.pairs;
+            self.metrics.snapshot_mut().counts_last.collision_islands = collision.islands;
+            self.metrics.snapshot_mut().counts_last.collision_island_max_pairs =
+                collision.max_island_pairs;
+        } else {
+            self.metrics.snapshot_mut().last.collide = Duration::ZERO;
+            self.metrics.snapshot_mut().counts_last.collision_pairs = 0;
+            self.metrics.snapshot_mut().counts_last.collision_islands = 0;
+            self.metrics.snapshot_mut().counts_last.collision_island_max_pairs = 0;
+        }
 
         let start = Instant::now();
         self.attract();
